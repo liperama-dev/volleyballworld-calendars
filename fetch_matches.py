@@ -6,21 +6,22 @@ import os
 import time
 from tqdm import tqdm
 import argparse
+import questionary
+from tzlocal import get_localzone
 
 # --- Configuration ---
 VW_API_BASE_URL = "https://en.volleyballworld.com/api/v1/"
 TOURNAMENT_API_BASE_URL = f"{VW_API_BASE_URL}volley-tournament/"
 
-OUTPUT_DIR = "superliga_calendars"  # Directory to save .ics files
-BRAZIL_TIMEZONE = pytz.timezone('America/Sao_Paulo')  # Brasília time (UTC-3)
-ICS_FILENAME_FORMAT = "{season_start}-{season_end}/{league}.ics"
+OUTPUT_DIR = "calendars"  # Generic name for the output directory
+ICS_FILENAME_FORMAT = "{season}/{league_slug}.ics"
 # SEASON_YEARS is now determined dynamically
 
 # --- Helper Functions ---
 
-def fetch_competitions_data(target_year, headers):
+def fetch_active_competitions(target_year, headers):
     """
-    Fetches the global list of competitions to find all available Superliga seasons.
+    Fetches the global list of competitions and filters for currently active ones.
     """
     competitions_url = f"{VW_API_BASE_URL}globalschedule/competitions/{target_year}/"
     print(f"Fetching all available competitions from: {competitions_url}")
@@ -29,39 +30,46 @@ def fetch_competitions_data(target_year, headers):
         response.raise_for_status()
         data = response.json()
         
-        competitions = {}
-        for comp in data.get('competitions', []):
-            short_name = comp.get('competitionShortName', '')
-            
-            # Find all Superliga competitions, regardless of year
-            if short_name == "SuperLiga Masculina":
-                season = comp.get('season', 'UnknownSeason')
-                league_season_name = f"Superliga Masculina {season}-{int(season)+1}"
-                competitions[league_season_name] = {
-                    "id": comp.get('menTournaments'),
-                    "startDate": comp.get('startDate'),
-                    "endDate": comp.get('endDate'),
-                    "season": season,
-                    "shortName": short_name
-                }
-            elif short_name == "SuperLiga Feminina":
-                season = comp.get('season', 'UnknownSeason')
-                league_season_name = f"Superliga Feminina {season}-{int(season)+1}"
-                competitions[league_season_name] = {
-                    "id": comp.get('womenTournaments'),
-                    "startDate": comp.get('startDate'),
-                    "endDate": comp.get('endDate'),
-                    "season": season,
-                    "shortName": short_name
-                }
-        
-        if not competitions:
-            print(f"Warning: Could not find any Superliga competitions in the API response.")
+        active_competitions = []
+        now = datetime.now(pytz.utc)
 
-        return competitions
+        for comp in data.get('competitions', []):
+            start_date_str = comp.get('startDate')
+            end_date_str = comp.get('endDate')
+
+            if not start_date_str or not end_date_str:
+                continue
+
+            start_date = datetime.fromisoformat(start_date_str.replace('Z', '+00:00'))
+            end_date = datetime.fromisoformat(end_date_str.replace('Z', '+00:00'))
+
+            if start_date <= now <= end_date:
+                # Generate a slug from the URL, e.g., /.../superliga-masculina/ -> superliga-masculina
+                url_parts = comp.get('url', '').strip('/').split('/')
+                slug = url_parts[-1] if url_parts else 'unknown'
+                if not slug or '20' in slug: # Handle cases like /2024-2025/
+                    slug = url_parts[-2] if len(url_parts) > 1 else 'unknown'
+
+
+                tournament_id = comp.get('menTournaments') or comp.get('womenTournaments')
+
+                if tournament_id and slug != 'unknown':
+                    active_competitions.append({
+                        "id": tournament_id,
+                        "fullName": comp.get('competitionFullName', 'Unknown Competition'),
+                        "startDate": start_date,
+                        "endDate": end_date,
+                        "slug": slug,
+                        "season": comp.get('season')
+                    })
+        
+        if not active_competitions:
+            print(f"Warning: Could not find any active competitions for the season starting in {target_year}.")
+
+        return active_competitions
     except requests.exceptions.RequestException as e:
         print(f"Error fetching competitions data: {e}")
-        return {}
+        return []
 
 
 def get_calendar_date_range(filepath):
@@ -137,7 +145,7 @@ def fetch_schedule_from_api(tournament_id, start_date, end_date, headers):
     return fetch_with_retries(api_url, headers)
 
 
-def process_api_response(api_data, league_type):
+def process_api_response(api_data, league_type, league_slug):
     """
     Processes the JSON API response and extracts relevant match details.
     """
@@ -171,7 +179,8 @@ def process_api_response(api_data, league_type):
 
             summary = f"{home_team} x {away_team} - {league_type}"
             description = f"{league_type} - Match ID: {match_id}"
-            uid = f"volleyballworld-{league_type.lower().replace(' ', '-')}-{match_id}-{dt_utc.strftime('%Y%m%dT%H%M%SZ')}"
+            # UID should be stable and not dependent on the match time, which can change.
+            uid = f"volleyballworld-{league_slug}-{match_id}"
 
             events.append({
                 'summary': summary,
@@ -192,10 +201,13 @@ def generate_ics_file(events, filename, league_name):
     Generates an .ics file from a list of event dictionaries.
     """
     cal = Calendar()
-    cal.add('prodid', f'-//Volleyball World Superliga {league_name} Calendar//EN')
+    cal.add('prodid', f'-//Volleyball World {league_name} Calendar//EN')
     cal.add('version', '2.0')
-    cal.add('x-wr-calname', f'Superliga {league_name}')
-    cal.add('x-wr-timezone', BRAZIL_TIMEZONE.tzname(datetime.now()))  # Calendar's default timezone name
+    cal.add('x-wr-calname', f'{league_name}')
+    
+    # Use the system's local timezone
+    local_tz = get_localzone()
+    cal.add('x-wr-timezone', local_tz.zone)
 
     for event_data in events:
         event = Event()
@@ -217,13 +229,10 @@ def generate_ics_file(events, filename, league_name):
 # --- Main Script Execution ---
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Generate .ics calendar files for Superliga volleyball matches.")
-    parser.add_argument("--dry-run", action="store_true", help="Simulate the process without fetching all match details or writing files.")
+    parser = argparse.ArgumentParser(description="Generate .ics calendar files for volleyball matches.")
+    parser.add_argument("--dry-run", action="store_true", help="Lists active championships without fetching details or writing files.")
+    parser.add_argument("--update-existing", action="store_true", help="Run non-interactively and only update calendars that already exist.")
     args = parser.parse_args()
-
-    if args.dry_run:
-        print("\n*** --- DRY RUN MODE --- ***")
-        print("This will simulate the process without fetching all match details or writing files.\n")
 
     # Define headers once to be reused by all API calls
     headers = {
@@ -243,53 +252,71 @@ if __name__ == "__main__":
         'user-agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36',
     }
 
-    # Fetch all available Superliga competitions by querying the current year's endpoint
+    # Discover all currently active competitions
     current_year = 2025 #datetime.now().year
-    all_competitions = fetch_competitions_data(current_year, headers)
-
-    if not all_competitions:
-        print("Could not fetch any competition data. Exiting.")
-
-    # --- Active Season Selection ---
-    active_competitions = {}
-    now = datetime.now(pytz.utc)
-    for name, details in all_competitions.items():
-        start_date = datetime.fromisoformat(details['startDate'].replace('Z', '+00:00'))
-        end_date = datetime.fromisoformat(details['endDate'].replace('Z', '+00:00'))
-        if start_date <= now <= end_date:
-            active_competitions[name] = details
-            print(f"Found active season: {name} (runs from {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')})")
+    active_competitions = fetch_active_competitions(current_year, headers)
 
     if not active_competitions:
-        print("No active Superliga season found based on the current date. Exiting.")
+        print("Could not find any active competitions. Exiting.")
+        exit()
 
+    # In dry-run mode, just list findings and exit
+    if args.dry_run:
+        print("\n*** --- DRY RUN MODE --- ***")
+        print("--- Active Competitions Found ---")
+        for comp in active_competitions:
+            print(f"- {comp['fullName']} (Slug: {comp['slug']})")
+        exit()
 
-    for league_season_name, comp_details in active_competitions.items():
+    # --- Interactive or Automated Selection ---
+    if args.update_existing:
+        print("`--update-existing` flag is set. Processing only championships with existing calendars.")
+        selected_comps = []
+        for comp in active_competitions:
+            filename = ICS_FILENAME_FORMAT.format(
+                season=comp['season'],
+                league_slug=comp['slug']
+            )
+            filepath = os.path.join(OUTPUT_DIR, filename)
+            if os.path.exists(filepath):
+                selected_comps.append(comp)
+    else:
+        choices = []
+        for comp in active_competitions:
+            filename = ICS_FILENAME_FORMAT.format(
+                season=comp['season'],
+                league_slug=comp['slug']
+            )
+            filepath = os.path.join(OUTPUT_DIR, filename)
+            
+            choices.append({
+                'name': f"{comp['fullName']} ({comp['slug']})",
+                'value': comp,
+                'checked': os.path.exists(filepath)
+            })
+
+        selected_comps = questionary.checkbox(
+            'Which active championships would you like to process?',
+            choices=choices
+        ).ask()
+
+    if not selected_comps:
+        print("No championships selected. Exiting.")
+        exit()
+
+    for comp_details in selected_comps:
+        league_season_name = comp_details['fullName']
         print(f"\n--- Processing {league_season_name} ---")
 
         tournament_id = comp_details.get('id')
-        if not tournament_id:
-            print(f"Skipping {league_season_name}: Tournament ID not found in competition data.")
-            continue
-        
-        start_date_str = comp_details.get('startDate')
-        end_date_str = comp_details.get('endDate')
-
-        if not start_date_str or not end_date_str:
-            print(f"Skipping {league_season_name}: Start or end date not found.")
-            continue
-
-        start_date = datetime.fromisoformat(start_date_str.replace('Z', '+00:00'))
-        end_date = datetime.fromisoformat(end_date_str.replace('Z', '+00:00'))
+        start_date = comp_details.get('startDate')
+        end_date = comp_details.get('endDate')
         
         season_years = list(range(start_date.year, end_date.year + 1))
-
-        league_short_name = comp_details.get('shortName', league_season_name).lower().replace(' ', '_')
         
         filename = ICS_FILENAME_FORMAT.format(
-            season_start=start_date.year,
-            season_end=end_date.year,
-            league=league_short_name
+            season=comp_details['season'],
+            league_slug=comp_details['slug']
         )
         filepath = os.path.join(OUTPUT_DIR, filename)
 
@@ -331,11 +358,6 @@ if __name__ == "__main__":
             # Prepare for the next chunk by removing dates covered by this one
             all_match_dates = [d for d in all_match_dates if d > end_date_chunk]
 
-        if args.dry_run:
-            print(f"Dry Run: Would perform {len(fetch_ranges)} weekly fetches to update '{filepath}'.")
-            print("Skipping detailed fetch and file generation.")
-            continue # Move to the next competition in the loop
-
         all_fetched_events = []
         print("Fetching schedules in weekly chunks...")
         for start_chunk, end_chunk in tqdm(fetch_ranges, desc="Processing Weeks"):
@@ -343,7 +365,7 @@ if __name__ == "__main__":
             api_data = fetch_schedule_from_api(tournament_id, start_chunk, end_chunk, headers)
             
             if api_data:
-                events = process_api_response(api_data, league_season_name)
+                events = process_api_response(api_data, league_season_name, comp_details['slug'])
                 if events:
                     all_fetched_events.extend(events)
             
@@ -354,29 +376,32 @@ if __name__ == "__main__":
         all_events_for_ics = []
         
         # Add existing events first to preserve them
+        existing_uids = set()
         if os.path.exists(filepath):
             try:
                 with open(filepath, 'rb') as f:
                     existing_cal = Calendar.from_ical(f.read())
                     for component in existing_cal.walk('VEVENT'):
-                        event_data = {
-                            'summary': component.get('summary'),
-                            'dtstart': component.get('dtstart').dt,
-                            'dtend': component.get('dtend').dt,
-                            'location': component.get('location'),
-                            'description': component.get('description'),
-                            'uid': component.get('uid')
-                        }
-                        all_events_for_ics.append(event_data)
+                        # Check for UID to avoid adding event data if it's missing
+                        if component.get('uid'):
+                            uid_str = component.get('uid')
+                            existing_uids.add(uid_str)
+                            event_data = {
+                                'summary': component.get('summary'),
+                                'dtstart': component.get('dtstart').dt,
+                                'dtend': component.get('dtend').dt,
+                                'location': component.get('location'),
+                                'description': component.get('description'),
+                                'uid': uid_str
+                            }
+                            all_events_for_ics.append(event_data)
             except Exception as e:
                 print(f"Warning: Could not read events from existing calendar {filepath}. Error: {e}")
 
         for event in all_fetched_events:
             if event['uid'] not in existing_uids:
-                # To be absolutely sure, re-add all events if we couldn't read existing ones
-                if not os.path.exists(filepath) or existing_uids:
-                    all_events_for_ics.append(event)
-                    new_events_count += 1
+                all_events_for_ics.append(event)
+                new_events_count += 1
         
         print(f"Added {new_events_count} new events.")
 
@@ -384,9 +409,9 @@ if __name__ == "__main__":
             # Ensure the target directory exists before writing the file
             directory = os.path.dirname(filepath)
             os.makedirs(directory, exist_ok=True)
-            generate_ics_file(all_events_for_ics, filepath, league_season_name.split(" ")[-1])
+            generate_ics_file(all_events_for_ics, filepath, league_season_name)
         else:
             print(f"No events to generate calendar for {league_season_name}.")
 
-    print("\nScript finished. Check the 'superliga_calendars' directory for your .ics files.")
+    print("\nScript finished. Check the 'calendars' directory for your .ics files.")
     print("You can import these files directly into Apple Calendar or other calendar applications.")
